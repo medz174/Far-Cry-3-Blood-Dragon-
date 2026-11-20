@@ -1,0 +1,197 @@
+// fc3bd_trainer.exe - Far Cry 3: Blood Dragon cheat launcher.
+//
+//   1. Sets GodMode / UnlimitedAmmo / IgnorePlayer in GamerProfile.xml (backed up,
+//      then marked read-only so the game doesn't rewrite it on exit).
+//   2. Waits for the game process and injects fc3bd_speed.dll (speedhack).
+//
+// Usage:
+//   fc3bd_trainer.exe                        patch profile, wait for game, inject
+//   fc3bd_trainer.exe --process <name.exe>   override target process name
+//   fc3bd_trainer.exe --restore              put the original profile back
+//
+// Run it BEFORE starting the game: the profile is read at game startup.
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <tlhelp32.h>
+#include <shlobj.h>
+#include <knownfolders.h>
+#include <string>
+#include <stdio.h>
+#include <string.h>
+#include <wchar.h>
+
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
+
+static const wchar_t* kDefaultProc = L"fc3_blooddragon_d3d11.exe";
+static const char*    kAttrs[]     = { "GodMode", "UnlimitedAmmo", "IgnorePlayer" };
+
+// ---- file helpers -----------------------------------------------------------
+static bool ReadAll(const std::wstring& p, std::string& out) {
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz; GetFileSizeEx(h, &sz);
+    out.assign((size_t)sz.QuadPart, '\0');
+    DWORD got = 0;
+    bool ok = out.empty() || (ReadFile(h, &out[0], (DWORD)out.size(), &got, nullptr) && got == out.size());
+    CloseHandle(h);
+    return ok;
+}
+
+static bool WriteAll(const std::wstring& p, const std::string& data) {
+    SetFileAttributesW(p.c_str(), FILE_ATTRIBUTE_NORMAL);
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    bool ok = data.empty() || (WriteFile(h, data.data(), (DWORD)data.size(), &put, nullptr) && put == data.size());
+    CloseHandle(h);
+    return ok;
+}
+
+static std::wstring ProfilePath() {
+    PWSTR docs = nullptr;
+    std::wstring dir;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) dir = docs;
+    CoTaskMemFree(docs);
+    return dir + L"\\My Games\\Far Cry 3 Blood Dragon\\GamerProfile.xml";
+}
+
+// ---- profile patching -------------------------------------------------------
+// tag = text from '<' up to (not including) '>'. Forces name="1", inserting it
+// right after the tag name when missing.
+static void SetAttr(std::string& tag, const std::string& name) {
+    size_t pos = 0;
+    while ((pos = tag.find(name, pos)) != std::string::npos) {
+        bool startOk = pos > 0 && strchr(" \t\r\n", tag[pos - 1]);
+        size_t e = pos + name.size();
+        while (e < tag.size() && tag[e] == ' ') ++e;
+        if (startOk && e < tag.size() && tag[e] == '=') {
+            size_t q1 = tag.find('"', e);
+            size_t q2 = q1 == std::string::npos ? q1 : tag.find('"', q1 + 1);
+            if (q1 != std::string::npos && q2 != std::string::npos) {
+                tag.replace(q1 + 1, q2 - q1 - 1, "1");
+                return;
+            }
+        }
+        pos += name.size();
+    }
+    size_t nameEnd = tag.find_first_of(" \t\r\n/", 1);
+    if (nameEnd == std::string::npos) nameEnd = tag.size();
+    tag.insert(nameEnd, " " + name + "=\"1\"");
+}
+
+static bool PatchProfile() {
+    std::wstring path = ProfilePath(), bak = path + L".fc3bd.bak";
+    std::string xml;
+    if (!ReadAll(path, xml)) {
+        wprintf(L"profile not found:\n  %ls\nlaunch the game once so it creates it, then run this again.\n", path.c_str());
+        return false;
+    }
+    if (GetFileAttributesW(bak.c_str()) == INVALID_FILE_ATTRIBUTES)
+        CopyFileW(path.c_str(), bak.c_str(), TRUE);
+
+    size_t s = xml.find("<GameProfile");
+    if (s == std::string::npos) s = xml.find("<GamerProfile");
+    size_t e = s == std::string::npos ? s : xml.find('>', s);
+    if (s == std::string::npos || e == std::string::npos) {
+        wprintf(L"no <GameProfile ...> tag found in the profile; nothing patched.\n");
+        return false;
+    }
+    std::string tag = xml.substr(s, e - s);
+    for (const char* a : kAttrs) SetAttr(tag, a);
+    xml.replace(s, e - s, tag);
+
+    if (!WriteAll(path, xml)) { wprintf(L"couldn't write the profile.\n"); return false; }
+    SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_READONLY);
+    wprintf(L"profile patched: GodMode, UnlimitedAmmo, IgnorePlayer = 1 (backup kept).\n");
+    return true;
+}
+
+static bool RestoreProfile() {
+    std::wstring path = ProfilePath(), bak = path + L".fc3bd.bak";
+    if (GetFileAttributesW(bak.c_str()) == INVALID_FILE_ATTRIBUTES) { wprintf(L"no backup found.\n"); return false; }
+    SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+    if (!CopyFileW(bak.c_str(), path.c_str(), FALSE)) { wprintf(L"restore failed.\n"); return false; }
+    SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+    wprintf(L"original profile restored.\n");
+    return true;
+}
+
+// ---- injection --------------------------------------------------------------
+static DWORD FindPid(const std::wstring& name) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
+    DWORD pid = 0;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok && !pid; ok = Process32NextW(snap, &pe))
+        if (!_wcsicmp(pe.szExeFile, name.c_str())) pid = pe.th32ProcessID;
+    CloseHandle(snap);
+    return pid;
+}
+
+static bool Inject(DWORD pid, const std::wstring& dll) {
+    HANDLE h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+                           PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
+    if (!h) { wprintf(L"OpenProcess failed (%lu). try running as administrator.\n", GetLastError()); return false; }
+
+    BOOL self = FALSE, tgt = FALSE;
+    IsWow64Process(GetCurrentProcess(), &self);
+    IsWow64Process(h, &tgt);
+    if (self != tgt) {
+        wprintf(L"bitness mismatch: the game is %ls, this build is %ls. rebuild with the matching toolchain.\n",
+                tgt ? L"32-bit" : L"64-bit", self ? L"32-bit" : L"64-bit");
+        CloseHandle(h);
+        return false;
+    }
+
+    SIZE_T bytes = (dll.size() + 1) * sizeof(wchar_t);
+    void* mem = VirtualAllocEx(h, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    bool ok = mem && WriteProcessMemory(h, mem, dll.c_str(), bytes, nullptr);
+    if (ok) {
+        auto ll = (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
+        HANDLE t = CreateRemoteThread(h, nullptr, 0, ll, mem, 0, nullptr);
+        ok = t != nullptr;
+        if (t) {
+            WaitForSingleObject(t, 10000);
+            DWORD code = 0;
+            GetExitCodeThread(t, &code);
+            ok = code != 0;                       // LoadLibraryW returned NULL -> 0
+            CloseHandle(t);
+        }
+    }
+    if (mem) VirtualFreeEx(h, mem, 0, MEM_RELEASE);
+    CloseHandle(h);
+    return ok;
+}
+
+int wmain(int argc, wchar_t** argv) {
+    std::wstring proc = kDefaultProc;
+    bool restore = false;
+    for (int i = 1; i < argc; ++i) {
+        if (!wcscmp(argv[i], L"--restore")) restore = true;
+        else if (!wcscmp(argv[i], L"--process") && i + 1 < argc) proc = argv[++i];
+    }
+    if (restore) return RestoreProfile() ? 0 : 1;
+
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dll = exe;
+    dll = dll.substr(0, dll.find_last_of(L'\\') + 1) + L"fc3bd_speed.dll";
+    if (GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        wprintf(L"missing %ls (keep it next to this exe).\n", dll.c_str());
+        return 1;
+    }
+
+    if (!PatchProfile()) return 1;
+
+    wprintf(L"waiting for %ls ... start the game now.\n", proc.c_str());
+    DWORD pid;
+    while (!(pid = FindPid(proc))) Sleep(500);
+    Sleep(4000);                                  // let the engine DLLs finish loading
+
+    if (!Inject(pid, dll)) { wprintf(L"injection failed.\n"); return 1; }
+    wprintf(L"speedhack loaded. F6 toggle, Numpad +/- change multiplier.\n");
+    return 0;
+}
